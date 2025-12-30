@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+用法:
+  fix-symlinks.sh ROOT_DIR [--jobs N] [--dry-run] [--verbose]
+
+说明:
+  - 递归扫描 ROOT_DIR 下所有符号链接
+  - 若链接内容以 / 开头，则将其视为“以 ROOT_DIR 为根的绝对路径”，并转换为相对路径
+  - 若为悬空链接则删除
+  - 并行处理 + 进度条（若可用）
+  - 统计结果：delete / convert / skip
+
+参数:
+  --jobs N    并行数（默认: nproc）
+  --dry-run   只打印将要执行的操作
+  --verbose   打印更多信息
+EOF
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+DRY_RUN=0
+VERBOSE=0
+JOBS=""
+
+if [[ $# -lt 1 ]]; then usage; exit 2; fi
+ROOT_DIR="$1"; shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    --jobs) JOBS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "未知参数: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ ! -d "$ROOT_DIR" ]]; then
+  echo "错误: ROOT_DIR 不是目录: $ROOT_DIR" >&2
+  exit 2
+fi
+
+ROOT_ABS="$(cd "$ROOT_DIR" && pwd -P)"
+JOBS="${JOBS:-$(nproc)}"
+
+relpath() {
+  local from="$1" to="$2"
+  if have_cmd realpath; then
+    realpath --relative-to="$from" "$to"
+  elif have_cmd python3; then
+    python3 - <<'PY' "$from" "$to"
+import os, sys
+print(os.path.relpath(sys.argv[2], start=sys.argv[1]))
+PY
+  else
+    echo "错误: 缺少 realpath 或 python3" >&2
+    exit 3
+  fi
+}
+
+do_cmd() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '[dry-run] %q' "$1"; shift
+    for a in "$@"; do printf ' %q' "$a"; done
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+export ROOT_ABS DRY_RUN VERBOSE
+export -f have_cmd relpath do_cmd
+
+export LC_ALL=C
+
+# 统计总数（进度条 + skip 计算）
+total_links="$(find "$ROOT_ABS" -type l | wc -l)"
+
+# delete / convert 统计目录
+STATS_DIR="$(mktemp -d)"
+trap 'rm -rf "$STATS_DIR"' EXIT
+mkdir -p "$STATS_DIR"/{delete,convert}
+export STATS_DIR
+
+# 进度条（仅 TTY 且 pv 可用）
+if [[ -t 1 ]] && have_cmd pv; then
+  PV=(pv -0 -l -s "$total_links" -i 0.2)
+else
+  PV=(cat)
+fi
+
+find "$ROOT_ABS" -type l -print0 |
+"${PV[@]}" |
+xargs -0 -n 1 -P "$JOBS" bash -c '
+  set -euo pipefail
+  link="$1"
+
+  link_target="$(readlink -- "$link")"
+  link_dir="$(dirname -- "$link")"
+  link_dir_abs="$(cd "$link_dir" && pwd -P)"
+
+  if [[ "$link_target" == /* ]]; then
+    target_fs="${ROOT_ABS%/}${link_target}"
+    is_root_abs=1
+  else
+    target_fs="$link_dir_abs/$link_target"
+    is_root_abs=0
+  fi
+
+  # 悬空链接 → delete
+  if [[ ! -e "$target_fs" ]]; then
+    [[ $VERBOSE -eq 1 ]] && echo "删除悬空链接: $link -> $link_target"
+    do_cmd rm -f -- "$link"
+    touch "$STATS_DIR/delete/$$"
+    exit 0
+  fi
+
+  # 绝对路径 → 转相对
+  if [[ $is_root_abs -eq 1 ]]; then
+    new_rel="$(relpath "$link_dir_abs" "$target_fs")"
+    if [[ "$new_rel" != "$link_target" ]]; then
+      [[ $VERBOSE -eq 1 ]] && echo "转换为相对路径: $link -> $new_rel (原: $link_target)"
+      do_cmd ln -snf -- "$new_rel" "$link"
+      touch "$STATS_DIR/convert/$$"
+    fi
+  fi
+' _
+
+# 汇总统计
+del_cnt=$(find "$STATS_DIR/delete"  -type f | wc -l)
+conv_cnt=$(find "$STATS_DIR/convert" -type f | wc -l)
+skip_cnt=$(( total_links - del_cnt - conv_cnt ))
+
+[[ -t 1 ]] && echo
+echo "统计结果:"
+echo "  删除悬空链接: $del_cnt"
+echo "  转换为相对路径: $conv_cnt"
+echo "  跳过未修改: $skip_cnt"
+echo "  合计: $total_links"
